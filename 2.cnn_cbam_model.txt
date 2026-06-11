@@ -1,0 +1,252 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class EnhancedCBAM(nn.Module):
+
+def __init__(self, channels, reduction=16):
+        super(EnhancedCBAM, self).__init__()
+        
+            reduction = max(2, min(reduction, channels // 4))
+        
+            self.channel_attention = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),                     
+            nn.Conv1d(channels, channels // reduction, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(channels // reduction, channels, 1, bias=False),
+            nn.Sigmoid()
+        )
+        
+              kernel_size = 7
+              if kernel_size % 2 == 0:
+            kernel_size += 1
+            
+        # === 空间注意力模块 ===
+        self.spatial_attention = nn.Sequential(
+            nn.Conv1d(channels, 1, kernel_size, padding=kernel_size//2, bias=False),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, x):
+        """
+       # 1. 通道注意力
+        ca_weight = self.channel_attention(x)
+        x = x * ca_weight
+        
+        # 2. 空间注意力
+        sa_weight = self.spatial_attention(x)
+        x = x * sa_weight
+        
+        return x
+
+
+class MultiScaleResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernels=[3, 5, 7, 1]):
+        super(MultiScaleResidualBlock, self).__init__()
+        
+        branch_channels = out_channels // len(kernels)
+        self.branch_channels = branch_channels
+        
+      
+        self.branches = nn.ModuleList()
+        
+        for k in kernels:
+       
+            padding = k // 2 if k > 1 else 0
+            
+            conv = nn.Conv1d(
+                in_channels, 
+                branch_channels, 
+                kernel_size=k, 
+                padding=padding,
+                bias=False
+            )
+            self.branches.append(conv)
+        
+        # 批量归一化
+        self.bn = nn.BatchNorm1d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        
+        # 残差连接的1x1卷积
+        self.shortcut = nn.Conv1d(in_channels, out_channels, kernel_size=1, bias=False)
+        
+    def forward(self, x):
+        # 多尺度并行卷积
+        branch_outputs = []
+        for branch in self.branches:
+            branch_out = branch(x)
+            branch_outputs.append(branch_out)
+        
+        # 拼接多尺度输出
+        out = torch.cat(branch_outputs, dim=1)
+        
+        # 残差连接
+        shortcut = self.shortcut(x)
+        out = out + shortcut
+        
+        out = self.bn(out)
+        out = self.relu(out)
+        
+        return out
+
+
+class CNN_CBAM_CanopyHeight(nn.Module):
+    """
+       def __init__(self, input_channels=1, input_length=1420):
+        super(CNN_CBAM_CanopyHeight, self).__init__()
+        
+        # ========== 第一阶段: 初始低级特征提取 ==========
+              self.initial_stage = nn.Sequential(
+            nn.Conv1d(input_channels, 64, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm1d(64),
+            nn.ReLU(inplace=True)
+        )
+        
+        # ========== 第二阶段: 多尺度特征融合 ==========
+        # "多尺度并行处理后保留原始波形特异性信息，防止梯度消失"
+        self.multiscale_block = MultiScaleResidualBlock(
+            in_channels=64, 
+            out_channels=128, 
+            kernels=[3, 5, 7, 1]
+        )
+        
+               self.cbam1 = EnhancedCBAM(channels=128, reduction=16)
+        
+        # ========== 第三阶段: 特征深化阶段 ==========
+            self.deep_stage = nn.Sequential(
+            nn.Conv1d(128, 256, kernel_size=5, padding=2, bias=False),
+            nn.BatchNorm1d(256),
+            nn.ReLU(inplace=True)
+        )
+        
+        # ========== 第四阶段: 高级特征提取阶段 ==========
+            self.high_stage = nn.Sequential(
+            nn.Conv1d(256, 512, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(512),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.cbam2 = EnhancedCBAM(channels=512, reduction=16)
+        
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
+        
+        # ========== 第五阶段: 回归头 ==========
+              self.regression_head = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(512, 256),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm1d(256),
+            
+            nn.Dropout(0.5),
+            nn.Linear(256, 64),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm1d(64),
+            
+            nn.Linear(64, 1)
+        )
+        
+        # 初始化权重
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+              for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.constant_(m.bias, 0)
+    
+    def forward(self, x):
+        """
+               
+        Args:
+            x: 输入波形 [batch_size, 1, 1420]
+        Returns:
+            冠层高度预测值 [batch_size, 1]
+        """
+        # 第一阶段: 初始低级特征提取
+        x = self.initial_stage(x)                   
+        # 第二阶段: 多尺度特征融合 + CBAM
+        x = self.multiscale_block(x)         # [B, 128, 710]
+        x = self.cbam1(x)                    # [B, 128, 710]        
+
+        # 第三阶段: 特征深化
+        x = self.deep_stage(x)               # [B, 256, 710]
+        
+        # 第四阶段: 高级特征提取 + CBAM
+        x = self.high_stage(x)               # [B, 512, 710]
+        x = self.cbam2(x)                    # [B, 512, 710]         
+        # 全局平均池化
+        x = self.global_pool(x)              # [B, 512, 1]
+        x = x.squeeze(-1)                    # [B, 512]
+        
+        # 第五阶段: 回归头预测
+        height = self.regression_head(x)     # [B, 1]
+        
+        return height
+
+
+# ========== 测试代码 ==========
+if __name__ == "__main__":
+    print("="*50)
+    print("CNN-CBAM 核心模型测试")
+    print("="*50)
+    
+    # 创建模型
+    model = CNN_CBAM_CanopyHeight(input_channels=1, input_length=1420)
+    
+    # 统计参数量
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    print(f"\n模型参数量统计:")
+    print(f"  总参数量: {total_params:,}")
+    print(f"  可训练参数量: {trainable_params:,}")
+    
+    # 测试前向传播
+    batch_size = 4
+    test_input = torch.randn(batch_size, 1, 1420)
+    
+    print(f"\n前向传播测试:")
+    print(f"  输入形状: {test_input.shape}")
+    
+    with torch.no_grad():
+        output = model(test_input)
+    
+    print(f"  输出形状: {output.shape}")
+    print(f"  输出示例: {output.squeeze().numpy()}")
+    
+    # 验证各模块输出维度
+    print(f"\n各模块输出维度验证:")
+    x = test_input
+    print(f"  输入: {x.shape}")
+    
+    x = model.initial_stage(x)
+    print(f"  initial_stage: {x.shape} 
+    
+    x = model.multiscale_block(x)
+    print(f"  multiscale_block: {x.shape} 
+    
+    x = model.cbam1(x)
+    print(f"  cbam1: {x.shape}")）
+    
+    x = model.deep_stage(x)
+    print(f"  deep_stage: {x.shape} ）
+    
+    x = model.high_stage(x)
+    print(f"  high_stage: {x.shape} ）
+    
+    x = model.cbam2(x)
+    print(f"  cbam2: {x.shape}")
+    
+    x = model.global_pool(x)
+    print(f"  global_pool: {x.shape} )
+    
+    x = x.squeeze(-1)
+    print(f"  squeeze: {x.shape})
+    
+ 
